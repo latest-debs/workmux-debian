@@ -1,0 +1,7 @@
+# Package definition for workmux
+
+package_name: workmux
+github_repo: raine/workmux
+license: MIT
+artifact_format: tar.gz
+description: "Git worktrees + tmux windows for zero-friction parallel dev"
