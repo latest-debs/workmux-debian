@@ -75,7 +75,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Build workmux
-        uses: ranjithrajv/debian-multiarch-builder@b8862826428d8a1a0e57030b12ca8eb1f6fee56d # v.0.1a28
+        uses: ranjithrajv/debian-multiarch-builder@14f43b7 # v.0.1a28
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
