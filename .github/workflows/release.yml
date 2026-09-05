@@ -2,11 +2,12 @@ name: Build workmux for Debian
 
 on:
   schedule:
+    # Auto-watch upstream every 3 hours and build new releases.
     - cron: '23 */3 * * *'
   workflow_dispatch:
     inputs:
       version:
-        description: The version to build
+        description: The version of raine/workmux to build (e.g. v1.0.0)
         type: string
         required: false
       build_version:
@@ -45,6 +46,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   prepare:
@@ -54,9 +56,14 @@ jobs:
       version: ${{ steps.detect.outputs.version }}
       build_version: ${{ steps.detect.outputs.build_version }}
       should_build: ${{ steps.detect.outputs.should_build }}
+      smoke_glob: ${{ steps.policy.outputs.smoke_glob }}
+      min_glibc: ${{ steps.policy.outputs.min_glibc }}
+      smoke_arch: ${{ steps.policy.outputs.smoke_arch }}
+      smoke_runner: ${{ steps.policy.outputs.smoke_runner }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
       - name: Detect version
         id: detect
         run: bash .github/scripts/detect-version.sh
@@ -65,18 +72,81 @@ jobs:
           MANUAL_VERSION: ${{ inputs.version }}
           BUILD_VERSION: ${{ inputs.build_version }}
           AUTO: ${{ github.event_name == 'schedule' || inputs.auto }}
+          IS_SCHEDULE: ${{ github.event_name == 'schedule' }}
+
+      - name: Read smoke policy from package.yaml
+        # Policy as data, read at runtime (not scaffold-time substitution):
+        # a per-tool smoke_skip glob and a minimum glibc floor are ordinary
+        # package.yaml edits - no workflow change needed to teach the smoke
+        # gate about plugin binaries or a glibc-cliff upstream.
+        id: policy
+        run: |
+          set -euo pipefail
+          read_val() {
+            awk -v k="$1" -F': *' '$1==k { v=$2; gsub(/["'\'' ]/, "", v); sub(/#.*/, "", v); print v; exit }' package.yaml
+          }
+          # Smoke runs natively on an architecture the release actually
+          # covers: arm64 whenever upstream ships it (the Pi audience this
+          # channel serves), amd64 otherwise. Without this an amd64-only
+          # upstream failed the gate with "all-suites-exhausted" - there was
+          # simply no arm64 .deb for the arm64-only smoke job to test, so
+          # such a package could never be released at all.
+          archs="$(awk '/^architectures:/{f=1;next} f&&/^  [a-z0-9]+:/{gsub(/[ :]/,"");print;next} f&&/^[^ #]/{exit}' package.yaml)"
+          [ -n "$archs" ] || archs="$(jq -r '.architectures.covered[]?' .github/vet-report.json 2>/dev/null || true)"
+          if [ -z "$archs" ] || printf '%s\n' "$archs" | grep -qx arm64; then
+            smoke_arch=arm64; smoke_runner=ubuntu-24.04-arm
+          else
+            smoke_arch=amd64; smoke_runner=ubuntu-latest
+          fi
+          {
+            printf 'smoke_glob=%s\n' "$(read_val smoke_skip || true)"
+            printf 'min_glibc=%s\n' "$(read_val min_glibc || true)"
+            printf 'smoke_arch=%s\n' "$smoke_arch"
+            printf 'smoke_runner=%s\n' "$smoke_runner"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Recheck upstream license
+        # License gate (warn-only): recheck the live upstream SPDX license
+        # against the pin in package.yaml on every run, so a license change
+        # upstream can't slip new builds through the auto-watch silently.
+        id: license
+        run: bash .github/scripts/license-check.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build:
     name: Build
     needs: prepare
     if: needs.prepare.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    # Native arm64 runner: arm64 is the Raspberry Pi audience's architecture
+    # and the bulk of this channel's consumers. Building on arm64 hardware
+    # (instead of cross-packaging on x64) is faster and validates arm64
+    # natively; the builder packages every architecture either way.
+    runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
+      - name: Cache upstream downloads
+        uses: actions/cache@v4
+        with:
+          path: /tmp/download_cache
+          key: download-workmux-${{ needs.prepare.outputs.version }}
+          restore-keys: download-workmux-
+
+      - name: Cache apt archives
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-${{ runner.os }}-${{ hashFiles('package.yaml') }}
+          restore-keys: apt-${{ runner.os }}-
+
       - name: Build workmux
-        uses: ranjithrajv/debian-multiarch-builder@cdb99d2fb282d18ca110788e2c559526666948a4 # v.0.1a29
+        uses: ranjithrajv/debian-multiarch-builder@d88a3077fb3114406932bade08647985022a5767 # v.0.1a29
         env:
+          # Authenticate GitHub API calls from the builder; anonymous calls
+          # from shared runner IPs are rate-limited (60/h) and caused
+          # architecture detection to find zero release assets.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           config-file: 'package.yaml'
@@ -84,7 +154,24 @@ jobs:
           build-version: ${{ needs.prepare.outputs.build_version }}
           architecture: ${{ inputs.architecture }}
           lintian-check: ${{ inputs.enable_lintian }}
+          # Provenance pin recorded at vet time (add-package.sh scaffold).
+          # The builder verifies the downloaded upstream bytes against the
+          # pinned SHA-256 when the release matches the vetted version, so a
+          # release altered after vetting fails the build instead of being
+          # silently packaged.
           pinned-metadata: ${{ github.workspace }}/.github/release-metadata.json
+
+      - name: Upload builder summary on failure
+        # The builder writes build-summary.json (structured failure data) on
+        # both success and failure; persist it so the failure reporter can
+        # fold it into the notification instead of anyone scraping logs.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-summary
+          path: build-summary.json
+          if-no-files-found: ignore
+
       - name: Upload packages
         uses: actions/upload-artifact@v4
         with:
@@ -100,61 +187,270 @@ jobs:
     name: Smoke Test
     needs: [prepare, build]
     if: needs.build.result == 'success'
-    runs-on: ubuntu-latest
+    # Runs the packaged binaries on native hardware (no emulation, real
+    # runtime coverage) - arm64 by default, same architecture as Raspberry
+    # Pi, falling back to an amd64 runner for upstreams that publish no
+    # arm64 build at all (see the smoke_arch policy in prepare).
+    runs-on: ${{ needs.prepare.outputs.smoke_runner || 'ubuntu-24.04-arm' }}
     steps:
       - name: Download packages
         uses: actions/download-artifact@v4
         with:
           name: workmux-debian-packages
+
       - name: Run binaries from the built package
         run: |
           set -euo pipefail
-          DEB="" SUITE=""
-          for suite in bookworm trixie forky sid; do
-            mapfile -t debs < <(compgen -G "workmux_*+${suite}_amd64.deb")
-            if [ -n "${debs[0]:-}" ]; then
-              DEB="${debs[0]}"
-              SUITE="$suite"
-              break
-            fi
-          done
-          if [ -z "$DEB" ]; then
-            echo "::notice::No amd64 package available to smoke test; skipping"
-            exit 0
-          fi
           EXPECTED="${{ needs.prepare.outputs.version }}"
+          EXPECTED="${EXPECTED#workmux-}"
           EXPECTED="${EXPECTED#v}"
-          rm -rf smoke-root
-          dpkg-deb -x "$DEB" smoke-root
-          for bin in smoke-root/usr/bin/*; do
-            name="$(basename "$bin")"
+          # Per-tool smoke policy, read from package.yaml at runtime:
+          #   smoke_skip  glob of binaries that never report --version
+          #               (plugin-protocol helpers, alias binaries, protoc
+          #               plugins) - skipped, not failed
+          #   min_glibc   floor like "2.36" - suites older than it are
+          #               skipped outright instead of burned as a known
+          #               GLIBC-cliff failure (bullseye ships 2.31)
+          SKIP_GLOB="${{ needs.prepare.outputs.smoke_glob }}"
+          MIN_GLIBC="${{ needs.prepare.outputs.min_glibc }}"
+          SMOKE_ARCH="${{ needs.prepare.outputs.smoke_arch || 'arm64' }}"
+          [ -n "$SKIP_GLOB" ] || SKIP_GLOB='__no_smoke_skip_configured__'
+          # Suite -> its glibc version; keep in sync with suites.yaml order.
+          suite_glibc() {
+            case "$1" in
+              bullseye) echo 2.31 ;;
+              bookworm) echo 2.36 ;;
+              trixie)   echo 2.41 ;;
+              forky)    echo 2.42 ;;
+              sid)      echo 2.42 ;;
+              *)        echo 9.9 ;;
+            esac
+          }
+          # Smoke-test each suite in order (bullseye first) until one passes;
+          # the first passing suite is remembered for the Ubuntu alias pass
+          # below (which needs the alias-source .debs, not this one).
+          DEBIAN_PASS=""
+          for SUITE in bullseye bookworm trixie forky sid; do
+            if [ -n "$MIN_GLIBC" ] && \
+               [ "$(printf '%s\n%s\n' "$(suite_glibc "$SUITE")" "$MIN_GLIBC" | sort -V | head -n1)" = "$(suite_glibc "$SUITE")" ] && \
+               [ "$(suite_glibc "$SUITE")" != "$MIN_GLIBC" ]; then
+              echo "Skipping $SUITE (glibc $(suite_glibc "$SUITE") < min_glibc $MIN_GLIBC)"
+              continue
+            fi
+            mapfile -t debs < <(compgen -G "workmux_*+${SUITE}_${SMOKE_ARCH}.deb")
+            if [ -z "${debs[0]:-}" ]; then continue; fi
+            DEB="${debs[0]}"
+            echo "Trying $SUITE: $DEB (expected $EXPECTED)"
+            rm -rf smoke-root
+            dpkg-deb -x "$DEB" smoke-root
+            mapfile -t bin_names < <(basename -a smoke-root/usr/bin/*)
+            if [ -z "${bin_names[0]:-}" ]; then continue; fi
+          # Actually install the .deb (not just extract + mount usr/bin) so
+          # this exercises what a real `apt install` does: bundle-mode
+          # packages symlink /usr/bin/<name> to an ABSOLUTE path under
+          # /usr/lib/<package>/ (e.g. pnpm, zed), which only resolves once
+          # the package is installed at its real root - mounting just
+          # usr/bin left those as dangling symlinks. Installing also
+          # exercises any Depends: the package declares (e.g. pnpm needs
+          # libatomic1), catching a missing runtime dependency here instead
+          # of shipping a package that crashes for every user.
+          # shellcheck disable=SC2016 # intentionally unexpanded here - this
+          # string is handed to a nested `bash -c` invocation below, which
+          # is what expands $1/$name/$out/etc., not this outer shell.
+          smoke_script='set -e
+          apt-get update -qq
+          apt-get install -y -qq "$1" >/dev/null
+          shift; expected="$1"; skip_glob="$2"; shift 2
+          for name in "$@"; do
+            # Binaries listed in package.yaml smoke_skip are not standalone
+            # CLIs (plugin protocol, aliases, protoc plugins) and never
+            # report --version - skip them.
+            case "$name" in
+              $skip_glob) echo "  SKIP: $name (smoke_skip)"; continue;;
+            esac
             ok=0
             for arg in --version -V version; do
-              out="$(docker run --rm -v "$PWD/smoke-root/usr/bin:/bins:ro" debian:$SUITE bash -c "chmod +x /bins/$name; /bins/$name $arg 2>&1 || true")"
-              if [ -n "$out" ] && printf '%s' "$out" | grep -q "$EXPECTED"; then
-                echo "  OK: $name $arg (on $SUITE) -> $(printf '%s' "$out" | head -1)"
+              out="$("$name" "$arg" 2>&1 || true)"
+              if [ -n "$out" ] && printf "%s" "$out" | grep -q "$expected"; then
+                echo "  OK: $name $arg -> $(printf "%s" "$out" | head -1)"
                 ok=1
                 break
               fi
             done
-            if [ "$ok" != 1 ]; then
-              echo "::error::Smoke test failed for $name on $SUITE (expected version $EXPECTED)"
-              exit 1
-            fi
+            # Emit the failing binary output BEFORE SMOKE_FAIL so the outer
+            # suite loop GLIBC grep can fall through to a newer suite.
+            [ "$ok" = 1 ] || { echo "$out" | head -5; echo "SMOKE_FAIL:$name"; exit 1; }
           done
-          echo "All binaries passed the smoke test"
+          echo "ALL_OK"'
+            out="$(docker run --rm -e ZED_ALLOW_ROOT=true -v "$PWD/$DEB:/pkg.deb:ro" "debian:$SUITE" \
+              bash -c "$smoke_script" _ /pkg.deb "$EXPECTED" "$SKIP_GLOB" "${bin_names[@]}" 2>&1)" || true
+            echo "$out"
+            if echo "$out" | grep -q "^ALL_OK$"; then
+              echo "All binaries passed the smoke test on $SUITE"
+              DEBIAN_PASS="$SUITE"
+              break
+            fi
+            if echo "$out" | grep -q "GLIBC"; then
+              echo "::warning::Smoke failed on $SUITE due to GLIBC mismatch [failure-class: glibc], trying next suite"
+              continue
+            fi
+            echo "::error::Smoke test failed on $SUITE (expected version $EXPECTED) [failure-class: version-cmd]"
+            exit 1
+          done
+          if [ -z "$DEBIAN_PASS" ]; then
+            echo "::notice::No suite passed smoke test [failure-class: all-suites-exhausted]"
+            exit 1
+          fi
+          # ---- Ubuntu alias coverage (warn-only) ----
+          # suites.json serves the Ubuntu suites as pool copies of a Debian
+          # suite (jammy<-bullseye; noble/questing/resolute<-trixie) - i.e.
+          # "Ubuntu works" is currently an assumption, never a test. Run the
+          # same install + version probe inside the real ubuntu:* images for
+          # each alias, using the .deb of the suite the alias is served
+          # from, so an alias that can't actually run (glibc floor, a
+          # Depends that Ubuntu's archive can't resolve) surfaces here
+          # instead of in user bug reports.
+          # Warn-only while the alias matrix is young: each failure shows up
+          # as an annotation and a job-summary row for the draft reviewer
+          # (the human gate reads them before publishing) without blocking
+          # the release. Once an alias has been green across the catalog,
+          # flip it to a hard gate by replacing its ::warning with exit 1.
+          sm() { # job-summary row (or stdout when not on Actions)
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf '%s\n' "$*" >> "$GITHUB_STEP_SUMMARY"
+            else
+              printf '%s\n' "$*"
+            fi
+          }
+          ubuntu_fail=0
+          sm ""
+          sm "### Ubuntu alias smoke coverage"
+          sm ""
+          sm "| Alias | From suite | Result |"
+          sm "|-------|------------|--------|"
+          while read -r U SUITE; do
+            [ -n "$U" ] || continue
+            mapfile -t udebs < <(compgen -G "workmux_*+${SUITE}_${SMOKE_ARCH}.deb")
+            if [ -z "${udebs[0]:-}" ]; then
+              sm "| ubuntu:$U | $SUITE | skip (no $SUITE .deb built) |"
+              continue
+            fi
+            UDEB="${udebs[0]}"
+            rm -rf smoke-root
+            dpkg-deb -x "$UDEB" smoke-root
+            mapfile -t ubin_names < <(basename -a smoke-root/usr/bin/*)
+            if [ -z "${ubin_names[0]:-}" ]; then
+              sm "| ubuntu:$U | $SUITE | skip (no binaries in package) |"
+              continue
+            fi
+            uout="$(docker run --rm -e ZED_ALLOW_ROOT=true -v "$PWD/$UDEB:/pkg.deb:ro" "ubuntu:$U" \
+              bash -c "$smoke_script" _ /pkg.deb "$EXPECTED" "$SKIP_GLOB" "${ubin_names[@]}" 2>&1)" || true
+            if echo "$uout" | grep -q "^ALL_OK$"; then
+              echo "Ubuntu alias smoke passed on ubuntu:$U ($SUITE build)"
+              sm "| ubuntu:$U | $SUITE | pass |"
+            else
+              ubuntu_fail=$((ubuntu_fail + 1))
+              sm "| ubuntu:$U | $SUITE | FAIL |"
+              echo "$uout" | tail -20
+              echo "::warning::Ubuntu alias smoke failed on ubuntu:$U (from $SUITE) [failure-class: ubuntu-alias] - warn-only, see job summary"
+            fi
+          done <<'UBUNTU_ALIASES'
+          jammy bullseye
+          noble trixie
+          questing trixie
+          resolute trixie
+          UBUNTU_ALIASES
+          if [ "$ubuntu_fail" -gt 0 ]; then
+            echo "::notice::$ubuntu_fail Ubuntu alias(es) failed smoke (warn-only until the alias matrix is proven green)"
+          fi
+          exit 0
 
   release:
     name: Release
     if: github.ref == 'refs/heads/main' && needs.build.result == 'success' && needs.smoke.result == 'success'
     needs: [prepare, build, smoke]
     runs-on: ubuntu-latest
+    # Job-level block REPLACES the workflow-level one, so contents/actions are
+    # restated here. id-token + attestations are what the two attest steps
+    # need; scoping them to this job keeps build/smoke unable to sign anything.
+    permissions:
+      contents: write
+      actions: write
+      id-token: write
+      attestations: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
       - name: Download packages
         uses: actions/download-artifact@v4
         with:
           name: workmux-debian-packages
+
+      - name: Generate build provenance
+        # Nix-style build-provenance: records the builder action ref, the
+        # workflow run, the commit, and a SHA-256 of every shipped artifact
+        # alongside the vet-time upstream pin (if one exists yet) - so a
+        # .deb traces back to an inspectable CI run, not just a checksum.
+        run: bash .github/scripts/generate-provenance.sh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD_VERSION: ${{ needs.prepare.outputs.build_version }}
+
+      - name: Generate SBOM
+        # SPDX 2.3, derived from provenance.json so the two documents cannot
+        # disagree. Scope is the shipped artifacts + the upstream release they
+        # were packaged from - deliberately NOT a transitive dependency graph,
+        # and the document says so in its own comment field.
+        run: bash .github/scripts/generate-sbom.sh
+
+      - name: Gate duplicate release tags
+        # Refuse to (re)publish a release tag that already exists - published
+        # or draft - so a retry or double-dispatch can't clobber or fork it.
+        id: dup-gate
+        run: |
+          TAG="${{ needs.prepare.outputs.version }}+${{ needs.prepare.outputs.build_version }}"
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.id' >/dev/null 2>&1; then
+            echo "::warning::Release tag $TAG already exists (published or draft); skipping publish"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attest build provenance
+        # Sigstore-signed SLSA provenance, stored in GitHub's attestations API
+        # and verifiable by anyone with:
+        #   gh attestation verify <file.deb> --repo <owner>/<repo>
+        # provenance.json is our own record and is only as trustworthy as the
+        # host serving it; this is a cryptographic signature over the same
+        # facts, which is what a security review can actually check.
+        if: steps.dup-gate.outputs.exists == 'false'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            workmux_*.deb
+            *.dsc
+            *.debian.tar.xz
+            *.orig.tar.xz
+
+      - name: Attest SBOM
+        # Binds the SPDX document to those same artifacts, verifiable with:
+        #   gh attestation verify <file.deb> --repo <owner>/<repo> \
+        #     --predicate-type https://spdx.dev/Document
+        if: steps.dup-gate.outputs.exists == 'false'
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: |
+            workmux_*.deb
+            *.dsc
+            *.debian.tar.xz
+            *.orig.tar.xz
+          sbom-path: sbom.spdx.json
+
       - name: Publish release
+        if: steps.dup-gate.outputs.exists == 'false'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           draft: ${{ inputs.release_mode == 'draft' }}
@@ -165,4 +461,51 @@ jobs:
             *.dsc
             *.debian.tar.xz
             *.orig.tar.xz
+            provenance.json
+            sbom.spdx.json
           fail_on_unmatched_files: true
+
+      - name: Clear failure marker
+        # This run got the current tag through build + smoke + release, so
+        # any scheduled-retry dedup marker for it is stale - clear it.
+        # PATCH-to-empty first; some variable APIs reject empty values, in
+        # which case DELETE removes the variable outright.
+        if: always()
+        run: |
+          if ! gh api -X PATCH "repos/$GITHUB_REPOSITORY/actions/variables/SMOKE_FAIL_TAG" \
+               -f value="" >/dev/null 2>&1; then
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/variables/SMOKE_FAIL_TAG" >/dev/null 2>&1 \
+              || echo "No failure marker to clear"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  record-failure:
+    name: Record failure marker (schedule dedup)
+    needs: [prepare, build, smoke, release]
+    # Only scheduled runs are deduped - a manual dispatch must always retry
+    # (that's how a fix gets validated), and PR events have no marker either.
+    if: >-
+      always() &&
+      github.event_name == 'schedule' &&
+      contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write failure marker
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          if [ -z "$version" ]; then
+            echo "prepare failed before a version was determined; nothing to dedup on"
+            exit 0
+          fi
+          value="${version}@$(date +%s)"
+          if gh api "repos/$GITHUB_REPOSITORY/actions/variables/SMOKE_FAIL_TAG" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/actions/variables/SMOKE_FAIL_TAG" -f value="$value" >/dev/null
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/variables" \
+              -f name=SMOKE_FAIL_TAG -f value="$value" >/dev/null
+          fi
+          echo "Recorded failure marker: $value (scheduled retries of this tag skip for 48h)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

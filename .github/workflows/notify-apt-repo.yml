@@ -1,6 +1,9 @@
 name: Notify apt-repo of release
 
 on:
+  # Fires whenever a release becomes public - both auto-published builds and
+  # drafts promoted to published by a maintainer. Tells apt-repo to rebuild
+  # immediately instead of waiting for its ~6h scheduled run.
   release:
     types: [published]
 
