@@ -5,3 +5,10 @@ github_repo: raine/workmux
 license: MIT
 artifact_format: tar.gz
 description: "Git worktrees + tmux windows for zero-friction parallel dev"
+
+# Opt into native Ubuntu builds (builder >= v.0.1a29). Packages without
+# these are served from the Debian suites via the alias fallback.
+ubuntu_distributions:
+  - jammy
+  - noble
+  - resolute
